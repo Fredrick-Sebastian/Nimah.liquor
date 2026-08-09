@@ -1,0 +1,10 @@
+html, body { margin: 0; padding: 0; background: #141F18; }
+  * { box-sizing: border-box; }
+  input:focus, select:focus, button:focus { outline: 2px solid #C9A227; outline-offset: 1px; }
+  ::placeholder { color: #6C7A70; }
+  @media (max-width: 720px) {
+    .grid4 { grid-template-columns: 1fr !important; }
+    .grid3 { grid-template-columns: 1fr !important; }
+    .grid2 { grid-template-columns: 1fr !important; }
+    .shopgrid { grid-template-columns: 1fr !important; }
+  }
