@@ -17,30 +17,27 @@ const uid = (p = "") => p + Math.random().toString(36).slice(2, 9) + Date.now().
 const todayISO = () => new Date().toISOString().slice(0, 10);
 
 /* ---------------------------------------------------------------------- */
-/*  Storage — localStorage-backed (this file runs standalone, no server) */
+/*  Backend API client — talks to the Node/Express + SQLite server in     */
+/*  the /server folder. Change API_BASE if you deploy the server          */
+/*  somewhere other than your own machine on port 4000.                   */
 /* ---------------------------------------------------------------------- */
-const LS_PREFIX = "nimah_";
-async function loadKey(key, fallback) {
-  try {
-    const raw = localStorage.getItem(LS_PREFIX + key);
-    return raw ? JSON.parse(raw) : fallback;
-  } catch { return fallback; }
-}
-async function saveKey(key, value) {
-  try { localStorage.setItem(LS_PREFIX + key, JSON.stringify(value)); }
-  catch (e) { console.error("storage save failed", key, e); }
-}
+const API_BASE = window.NIMAH_API_BASE || "http://localhost:4000/api";
 
-const SEED_USERS = [
-  { id: uid("u"), username: "admin", password: "admin123", role: "admin", name: "Neema Hamisi" },
-  { id: uid("u"), username: "worker", password: "worker123", role: "worker", name: "Store Attendant" },
-];
-const SEED_PRODUCTS = [
-  { id: uid("p"), name: "Konyagi 750ml", category: "Spirits", unit: "Bottle", openingStock: 50, cost: 8000, price: 12000, reorder: 10 },
-  { id: uid("p"), name: "Serengeti Lager 500ml", category: "Beer", unit: "Bottle", openingStock: 200, cost: 1500, price: 2500, reorder: 30 },
-  { id: uid("p"), name: "Kilimanjaro Lager 500ml", category: "Beer", unit: "Bottle", openingStock: 150, cost: 1500, price: 2500, reorder: 30 },
-  { id: uid("p"), name: "Amarula 750ml", category: "Liqueur", unit: "Bottle", openingStock: 20, cost: 25000, price: 35000, reorder: 5 },
-];
+async function apiGet(path) {
+  const r = await fetch(`${API_BASE}${path}`);
+  if (!r.ok) throw new Error((await safeJson(r)).error || `Request failed (${r.status})`);
+  return r.json();
+}
+async function apiSend(method, path, body) {
+  const r = await fetch(`${API_BASE}${path}`, {
+    method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}),
+  });
+  if (!r.ok) throw new Error((await safeJson(r)).error || `Request failed (${r.status})`);
+  return r.json();
+}
+const apiPost = (path, body) => apiSend("POST", path, body);
+const apiPut = (path, body) => apiSend("PUT", path, body);
+async function safeJson(r) { try { return await r.json(); } catch { return {}; } }
 
 /* ---------------------------------------------------------------------- */
 /*  Inline icon set (no external icon library)                            */
@@ -219,7 +216,7 @@ function Empty({ text }) { return <div style={{ color: T.paperDim, fontSize: 13,
 /* ---------------------------------------------------------------------- */
 function App() {
   const [ready, setReady] = useState(false);
-  const [users, setUsers] = useState([]);
+  const [offline, setOffline] = useState(false);
   const [products, setProducts] = useState([]);
   const [purchases, setPurchases] = useState([]);
   const [sales, setSales] = useState([]);
@@ -230,15 +227,15 @@ function App() {
   const notify = useCallback((msg) => { setToast(msg); setTimeout(() => setToast(null), 2600); }, []);
 
   const refreshAll = useCallback(async () => {
-    const [u, p, pu, sa, or] = await Promise.all([
-      loadKey("users", null), loadKey("products", null),
-      loadKey("purchases", []), loadKey("sales", []), loadKey("orders", []),
-    ]);
-    let finalUsers = u, finalProducts = p;
-    if (!u) { finalUsers = SEED_USERS; await saveKey("users", finalUsers); }
-    if (!p) { finalProducts = SEED_PRODUCTS; await saveKey("products", finalProducts); }
-    setUsers(finalUsers); setProducts(finalProducts);
-    setPurchases(pu); setSales(sa); setOrders(or);
+    try {
+      const [p, pu, sa, or] = await Promise.all([
+        apiGet("/products"), apiGet("/purchases"), apiGet("/sales"), apiGet("/orders"),
+      ]);
+      setProducts(p); setPurchases(pu); setSales(sa); setOrders(or);
+      setOffline(false);
+    } catch (e) {
+      setOffline(true);
+    }
   }, []);
 
   useEffect(() => { (async () => { await refreshAll(); setReady(true); })(); }, [refreshAll]);
@@ -250,45 +247,69 @@ function App() {
     return opening + bought - sold;
   }, [products, purchases, sales]);
 
-  const persist = {
-    users: async (next) => { setUsers(next); await saveKey("users", next); },
-    products: async (next) => { setProducts(next); await saveKey("products", next); },
-    purchases: async (next) => { setPurchases(next); await saveKey("purchases", next); },
-    sales: async (next) => { setSales(next); await saveKey("sales", next); },
-    orders: async (next) => { setOrders(next); await saveKey("orders", next); },
+  const guarded = (fn) => async (...args) => {
+    try { return await fn(...args); }
+    catch (e) { notify(e.message || "Couldn't reach the server"); }
   };
 
-  const addProduct = async (prod) => persist.products([...products, { id: uid("p"), ...prod }]);
-  const addPurchase = async (row) => persist.purchases([{ id: uid("pu"), ...row }, ...purchases]);
-  const addSale = async (row) => persist.sales([{ id: uid("s"), ...row }, ...sales]);
-  const placeOrder = async (order) => persist.orders([{ id: uid("o"), status: "pending", createdAt: todayISO(), ...order }, ...orders]);
+  const addProduct = guarded(async (prod) => {
+    const created = await apiPost("/products", prod);
+    setProducts((cur) => [...cur, created]);
+  });
+  const addPurchase = guarded(async (row) => {
+    const created = await apiPost("/purchases", row);
+    setPurchases((cur) => [created, ...cur]);
+  });
+  const addSale = guarded(async (row) => {
+    const created = await apiPost("/sales", row);
+    setSales((cur) => [created, ...cur]);
+  });
+  const placeOrder = guarded(async (order) => {
+    const created = await apiPost("/orders", order);
+    setOrders((cur) => [created, ...cur]);
+  });
+  const fulfillOrder = guarded(async (orderId, invoiceNo) => {
+    const updated = await apiPut(`/orders/${orderId}/fulfill`, { invoiceNo });
+    setOrders((cur) => cur.map((o) => (o.id === orderId ? updated : o)));
+    const sa = await apiGet("/sales");
+    setSales(sa);
+    notify(`Order fulfilled — invoice ${updated.invoiceNo} created`);
+  });
+  const cancelOrder = guarded(async (orderId) => {
+    const updated = await apiPut(`/orders/${orderId}/cancel`);
+    setOrders((cur) => cur.map((o) => (o.id === orderId ? updated : o)));
+  });
 
-  const fulfillOrder = async (orderId, invoiceNo) => {
-    const order = orders.find((o) => o.id === orderId);
-    if (!order) return;
-    const newSales = order.items.map((it) => ({ id: uid("s"), date: todayISO(), invoiceNo, productId: it.productId, qty: it.qty, price: it.price, customer: order.customerName, payment: "Order" }));
-    await persist.sales([...newSales, ...sales]);
-    await persist.orders(orders.map((o) => (o.id === orderId ? { ...o, status: "fulfilled", invoiceNo } : o)));
-    notify(`Order fulfilled — invoice ${invoiceNo} created`);
-  };
-  const cancelOrder = async (orderId) => persist.orders(orders.map((o) => (o.id === orderId ? { ...o, status: "cancelled" } : o)));
-
-  const login = (username, password, role) => {
-    const u = users.find((x) => x.username === username && x.password === password && x.role === role);
-    if (!u) return notify("Invalid username or password");
-    setCurrentUser(u);
+  const login = async (username, password, role) => {
+    try {
+      const u = await apiPost("/auth/login", { username, password, role });
+      setCurrentUser(u);
+    } catch (e) { notify(e.message || "Invalid username or password"); }
   };
   const signupCustomer = async (data) => {
-    if (users.some((u) => u.username === data.username)) return notify("That username is taken");
-    const u = { id: uid("u"), role: "customer", ...data };
-    await persist.users([...users, u]);
-    setCurrentUser(u);
+    try {
+      const u = await apiPost("/auth/signup", data);
+      setCurrentUser(u);
+    } catch (e) { notify(e.message || "Could not create account"); }
   };
   const logout = () => setCurrentUser(null);
 
   if (!ready) {
     return <div style={{ ...shellStyle, alignItems: "center", justifyContent: "center" }}>
       <div style={{ color: T.paperDim, fontFamily: DISPLAY, fontSize: 18 }}>Opening the cellar…</div>
+    </div>;
+  }
+
+  if (offline) {
+    return <div style={{ ...shellStyle, alignItems: "center", justifyContent: "center", padding: 24 }}>
+      <div style={{ maxWidth: 420, textAlign: "center" }}>
+        <div style={{ color: T.gold, fontFamily: DISPLAY, fontSize: 22, marginBottom: 10 }}>Can't reach the server</div>
+        <div style={{ color: T.paperDim, fontSize: 14, lineHeight: 1.6 }}>
+          This page talks to the backend at <code style={{ color: T.paper }}>{API_BASE}</code>.
+          Make sure the server is running (<code style={{ color: T.paper }}>cd server && npm start</code>), then reload this page.
+        </div>
+        <Button style={{ marginTop: 18 }} onClick={() => window.location.reload()}>Retry</Button>
+      </div>
     </div>;
   }
 
@@ -305,7 +326,8 @@ function App() {
         <Shell user={currentUser} onLogout={logout}
           products={products} purchases={purchases} sales={sales} orders={orders} stockFor={stockFor}
           addProduct={addProduct} addPurchase={addPurchase} addSale={addSale}
-          placeOrder={placeOrder} fulfillOrder={fulfillOrder} cancelOrder={cancelOrder} notify={notify} />
+          placeOrder={placeOrder} fulfillOrder={fulfillOrder} cancelOrder={cancelOrder} notify={notify}
+          refreshAll={refreshAll} />
       )}
     </div>
   );
@@ -388,7 +410,10 @@ const linkStyle = { color: T.goldLight, cursor: "pointer", fontWeight: 700 };
 /* ---------------------------------------------------------------------- */
 function Shell({ user, onLogout, ...rest }) {
   const tabsByRole = {
-    admin: [{ id: "dashboard", label: "Dashboard", icon: "dashboard" }],
+    admin: [
+      { id: "dashboard", label: "Dashboard", icon: "dashboard" },
+      { id: "backup", label: "Backup & Restore", icon: "clipboard" },
+    ],
     worker: [
       { id: "products", label: "Products & Stock", icon: "boxes" },
       { id: "purchases", label: "Purchases", icon: "package" },
@@ -423,6 +448,7 @@ function Shell({ user, onLogout, ...rest }) {
       </div>
       <div style={{ padding: 20, flex: 1 }}>
         {user.role === "admin" && tab === "dashboard" && <AdminDashboard {...rest} />}
+        {user.role === "admin" && tab === "backup" && <BackupPanel {...rest} />}
         {user.role === "worker" && tab === "products" && <WorkerProducts {...rest} />}
         {user.role === "worker" && tab === "purchases" && <WorkerPurchases {...rest} />}
         {user.role === "worker" && tab === "sales" && <WorkerSales {...rest} />}
@@ -651,6 +677,60 @@ function WorkerOrders({ orders, products, fulfillOrder, cancelOrder }) {
 /* ---------------------------------------------------------------------- */
 /*  ADMIN — Dashboard                                                     */
 /* ---------------------------------------------------------------------- */
+function BackupPanel({ notify, refreshAll }) {
+  const [busy, setBusy] = useState(false);
+  const fileRef = React.useRef(null);
+
+  const downloadBackup = () => {
+    // triggers the browser's normal file download for GET /api/backup
+    window.location.href = `${API_BASE}/backup`;
+    notify("Backup download started");
+  };
+
+  const restoreBackup = async (file) => {
+    if (!file) return;
+    setBusy(true);
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      const result = await apiPost("/backup/restore", data);
+      await refreshAll();
+      notify(`Backup restored (${new Date(result.restoredAt).toLocaleString()})`);
+    } catch (e) {
+      notify(e.message || "Could not restore that backup file");
+    } finally {
+      setBusy(false);
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 18, maxWidth: 640 }}>
+      <Card style={{ padding: 18 }}>
+        <SectionTitle icon="clipboard" title="Download a backup"
+          sub="Saves every product, purchase, sale and order as one JSON file you can keep safe or hand to a new machine." />
+        <Button style={{ marginTop: 14 }} onClick={downloadBackup}><Icon name="package" size={14} /> Download backup (.json)</Button>
+      </Card>
+
+      <Card style={{ padding: 18 }}>
+        <SectionTitle icon="clock" title="Restore from a backup"
+          sub="Replaces all current data with what's in the chosen file. Use this after a reinstall, or to undo a mistake." />
+        <div style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 10 }}>
+          <input ref={fileRef} type="file" accept="application/json"
+            onChange={(e) => restoreBackup(e.target.files[0])} disabled={busy}
+            style={{ fontSize: 13, color: T.paperDim }} />
+          {busy && <span style={{ fontSize: 12, color: T.paperDim }}>Restoring…</span>}
+        </div>
+      </Card>
+
+      <Card style={{ padding: 18 }}>
+        <SectionTitle icon="shield" title="Automatic backups"
+          sub="The server also saves a snapshot on its own, once a day, into the server/backups folder (keeping the most recent 14). Downloading a backup here is for keeping an extra copy off the server — on a USB drive, email, or cloud storage." />
+      </Card>
+    </div>
+  );
+}
+
 function AdminDashboard({ products, purchases, sales, orders, stockFor }) {
   const totalStockValue = useMemo(() => products.reduce((s, p) => s + stockFor(p.id) * p.cost, 0), [products, stockFor]);
   const lowStock = useMemo(() => products.filter((p) => stockFor(p.id) <= p.reorder), [products, stockFor]);
